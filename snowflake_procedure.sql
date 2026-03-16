@@ -1,42 +1,36 @@
 CREATE OR REPLACE PROCEDURE CHECK_NULL_COUNTS(FULL_TABLE_NAME STRING, COLUMN_LIST STRING, KEY_COLUMN_LIST STRING)
 RETURNS TABLE (COLUMN_NAME STRING, NULL_COUNT NUMBER)
-LANGUAGE JAVASCRIPT
+LANGUAGE SQL
 EXECUTE AS CALLER
 AS
-$$
-    // Split the column list into an array
-    var cols = COLUMN_LIST.split(',').map(function(item) {
-        return item.trim();
-    });
+DECLARE
+    final_sql STRING;
+    res RESULTSET;
+BEGIN
+    -- Construct the dynamic SQL using a query for string manipulation
+    WITH cols AS (
+        -- Split the comma-separated list into rows
+        SELECT trim(value::string) as col
+        FROM table(flatten(input => split(:COLUMN_LIST, ',')))
+        WHERE col != ''
+    ),
+    count_expressions AS (
+        -- Create the COUNT_IF expressions for the base scan
+        SELECT listagg('COUNT_IF("' || replace(col, '"', '""') || '" IS NULL) AS "' || replace(col, '"', '""') || '"', ', ') as count_clause
+        FROM cols
+    ),
+    unpivot_expressions AS (
+        -- Create the UNION ALL parts to turn columns into rows
+        SELECT listagg('SELECT ''' || replace(col, '''', '''''') || ''' AS COLUMN_NAME, "' || replace(col, '"', '""') || '" AS NULL_COUNT FROM __COUNTS__', ' UNION ALL ') as union_clause
+        FROM cols
+    )
+    SELECT
+        'WITH __COUNTS__ AS (SELECT ' || count_clause || ' FROM IDENTIFIER(''' || replace(:FULL_TABLE_NAME, '''', '''''') || ''')) ' ||
+        'SELECT * FROM (' || union_clause || ') WHERE NULL_COUNT > 0'
+    INTO :final_sql
+    FROM count_expressions, unpivot_expressions;
 
-    if (cols.length === 0 || (cols.length === 1 && cols[0] === "")) {
-        // Return empty result set if no columns provided
-        return snowflake.execute({sqlText: "SELECT CAST(NULL AS STRING) AS COLUMN_NAME, CAST(NULL AS NUMBER) AS NULL_COUNT WHERE 1=0"});
-    }
-
-    // To perform a single scan of the table, we calculate all null counts first
-    var countExpressions = cols.map(function(col) {
-        var escaped = col.replace(/"/g, '""');
-        return `COUNT_IF("${escaped}" IS NULL) AS "${escaped}"`;
-    }).join(", ");
-
-    var baseQuery = `SELECT ${countExpressions} FROM IDENTIFIER(:1)`;
-
-    // We then unpivot the results using UNION ALL on the single row of counts
-    var unionParts = cols.map(function(col) {
-        var escaped = col.replace(/"/g, '""');
-        return `SELECT '${escaped.replace(/'/g, "''")}' AS COLUMN_NAME, "${escaped}" AS NULL_COUNT FROM __COUNTS__`;
-    }).join(" UNION ALL ");
-
-    var finalSql = `WITH __COUNTS__ AS (${baseQuery}) SELECT * FROM (${unionParts}) WHERE NULL_COUNT > 0`;
-
-    try {
-        var statement = snowflake.createStatement({
-            sqlText: finalSql,
-            binds: [FULL_TABLE_NAME]
-        });
-        return statement.execute();
-    } catch (err) {
-        throw "Error executing procedure: " + err.message + "\nSQL: " + finalSql;
-    }
-$$;
+    -- Execute the dynamic SQL and return the result set as a table
+    res := (EXECUTE IMMEDIATE :final_sql);
+    RETURN TABLE(res);
+END;
